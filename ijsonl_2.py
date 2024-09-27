@@ -63,37 +63,84 @@ class IJSONL:
         return fields
 
     def init_index(self, field: str):
-        """Initialize an index file for a new field."""
+        """Initialize an index file and a gaps file for a new field."""
         index_file = os.path.join(self.index_dir, f"{field}.index")
-        open(index_file, 'wb').close()  # Create an empty binary file
+        gaps_file = os.path.join(self.index_dir, f"{field}.gaps")
+        
+        with open(index_file, 'wb') as f:
+            # Write initial values for last_idx and num_entries
+            f.write(struct.pack('QQ', 0, 0))
+        
+        # Create an empty gaps file
+        open(gaps_file, 'wb').close()
 
     def append_index(self, field: str, idx: int, start_offset: int, end_offset: int):
-        """Append an index entry for a field in binary format."""
+        """Append an index entry for a field, updating gaps if necessary."""
         index_file = os.path.join(self.index_dir, f"{field}.index")
+        gaps_file = os.path.join(self.index_dir, f"{field}.gaps")
+        
         with open(index_file, 'r+b') as f:
-            entry_size = struct.calcsize('qq')  # 8 bytes for each int64
-            expected_position = (idx - 1) * entry_size
+            # Read and update lead int64s
+            last_idx, num_entries = struct.unpack('QQ', f.read(16))
             
-            f.seek(0, 2)  # Go to the end of the file
-            current_size = f.tell()
-            if current_size < expected_position:
-                f.write(struct.pack('qq', -1, -1) * ((expected_position - current_size) // entry_size))
+            if idx != last_idx + 1:
+                # Update gaps file
+                gap_start = last_idx + 1
+                gap_length = idx - last_idx - 1
+                with open(gaps_file, 'ab') as gf:
+                    gf.write(struct.pack('QQ', gap_start, gap_length))
             
-            f.seek(expected_position)
+            # Append new entry
+            f.seek(0, 2)  # Go to end of file
             f.write(struct.pack('QQ', start_offset, end_offset))
+            
+            # Update lead int64s
+            f.seek(0)
+            f.write(struct.pack('QQ', idx, num_entries + 1))
 
 
-    def get_index_entry(self, field: str, idx: int) -> Tuple[int, int]:
-        """Read an index entry for a field in binary format."""
+    def get_index_entry(self, field: str, row_number: int) -> Tuple[int, int]:
+        """Read an index entry for a field, given the row number."""
         index_file = os.path.join(self.index_dir, f"{field}.index")
+        
         with open(index_file, 'rb') as f:
-            entry_size = struct.calcsize('QQ')
-            f.seek((idx - 1) * entry_size)
-            return struct.unpack('QQ', f.read(entry_size))
+            last_idx, num_entries = struct.unpack('QQ', f.read(16))
+            
+            if row_number > last_idx:
+                raise IndexError(f"Row number {row_number} out of range")
+            
+            index_position = self.map_index_to_row(field, row_number)
+            
+            f.seek(16 + (index_position - 1) * 16)  # 16 bytes for lead int64s, 16 bytes per entry
+            return struct.unpack('QQ', f.read(16))
 
-    import json
-    from json import JSONDecoder
-    from typing import Dict, Tuple
+
+    def map_index_to_row(self, field: str, index_position: int) -> int:
+        """Map an index position to its actual row number, considering gaps."""
+        index_file = os.path.join(self.index_dir, f"{field}.index")
+        gaps_file = os.path.join(self.index_dir, f"{field}.gaps")
+        
+        with open(index_file, 'rb') as f:
+            last_idx, num_entries = struct.unpack('QQ', f.read(16))
+            
+            if index_position >= num_entries:
+                raise IndexError(f"Index position {index_position} out of range")
+        
+        row_number = index_position + 1  # Start with the assumption of no gaps
+        
+        with open(gaps_file, 'rb') as f:
+            while True:
+                gap_data = f.read(16)
+                if not gap_data:
+                    break
+                gap_start, gap_length = struct.unpack('QQ', gap_data)
+                if gap_start <= row_number:
+                    row_number += gap_length
+                else:
+                    break
+        
+        return row_number
+
 
     def traverse_json(self, json_str: str) -> Dict[str, Tuple[int, int]]:
         """Traverse JSON string and return field positions."""
