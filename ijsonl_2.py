@@ -4,14 +4,18 @@ import struct
 from json import JSONDecoder
 from typing import List, Tuple, Dict
 
+from parse_json_str import parse_json_positions_binary
+import io
+
 class IJSONL:
     HEADER_FORMAT = '<QQ'  # Two uint64: n and num_fields
 
     def __init__(self, filename: str):
-        self.filename = filename
-        self.header_file = f"{filename}_header.bin"
-        self.data_file = f"{filename}_data.jsonl"
-        self.index_dir = f"{filename}_indices"
+        self.filename = filename if filename.endswith('.ijsonl') else filename + '.ijsonl'
+        os.makedirs(self.filename, exist_ok=True)
+        self.header_file = os.path.join(self.filename, f"header.bin")
+        self.data_file = os.path.join(self.filename, f"data.jsonl")
+        self.index_dir = os.path.join(self.filename, f"indices")
         
         if not os.path.exists(self.header_file):
             self.init_header()
@@ -38,7 +42,6 @@ class IJSONL:
                 f.write(struct.pack('<H', len(field_bytes)))  # Write length as unsigned short
                 f.write(field_bytes)
 
-
     def increment_n(self):
         """Increment the 'n' value in the header."""
         with open(self.header_file, 'r+b') as f:
@@ -61,11 +64,9 @@ class IJSONL:
             for _ in range(num_fields):
                 length = struct.unpack('<H', f.read(2))[0]
                 field = f.read(length).decode('utf-8')
-                if field != 'RECORD':
+                if field != '__RECORD__':
                     fields.append(field)
         return fields
-
-
 
     def init_index(self, field: str):
         """Initialize an index file and a gaps file for a new field."""
@@ -87,43 +88,30 @@ class IJSONL:
 
 
     def append_index(self, field: str, idx: int, start_offset: int, end_offset: int):
-        """Append an index entry for a field, updating gaps if necessary."""
         index_file = os.path.join(self.index_dir, f"{field}.index")
-        gaps_file = os.path.join(self.index_dir, f"{field}.gaps")
         
         with open(index_file, 'r+b') as f:
-            # Check file size
-            f.seek(0, 2)  # Go to the end of the file
-            file_size = f.tell()
-            
-            # Read lead int64s
+            # Read current header
             f.seek(0)
-            if file_size >= 16:
-                last_idx, num_entries = struct.unpack('qQ', f.read(16))
+            header = f.read(16)
+            if len(header) == 16:
+                last_idx, num_entries = struct.unpack('QQ', header)
             else:
+                print(f"Warning: Index file for {field} has incomplete header")
                 last_idx, num_entries = -1, 0
-                f.seek(0)
-                f.write(struct.pack('qQ', last_idx, num_entries))
-                        
-            if idx != last_idx + 1:
-                # Update gaps file
-                gap_start = last_idx + 1
-                gap_length = idx - last_idx - 1
-                with open(gaps_file, 'ab') as gf:
-                    gf.write(struct.pack('QQ', gap_start, gap_length))
-            
+
+            print(f"Appending to index for {field}: idx={idx}, last_idx={last_idx}, num_entries={num_entries}")
+
+            # Update header
+            f.seek(0)
+            f.write(struct.pack('QQ', idx, num_entries + 1))
+
             # Append new entry
             f.seek(0, 2)  # Go to end of file
             f.write(struct.pack('QQ', start_offset, end_offset))
-            
-            # Update lead int64s
-            new_num_entries = num_entries + 1
-            f.seek(0)
-            f.write(struct.pack('qQ', idx, new_num_entries))
-            
-            # Verify the update
-            f.seek(0)
-            verify_last_idx, verify_num_entries = struct.unpack('qQ', f.read(16))
+
+            print(f"Updated index for {field}: new last_idx={idx}, new num_entries={num_entries + 1}")
+
 
     def get_index_entry(self, field: str, row_number: int) -> Tuple[int, int]:
         """Read an index entry for a field, given the row number."""
@@ -168,26 +156,48 @@ class IJSONL:
 
 
     def traverse_json(self, json_str: str) -> Dict[str, Tuple[int, int]]:
-        """Traverse JSON string and return field positions."""
         decoder = JSONDecoder()
-        field_positions = {'RECORD': (0, len(json_str))}
+        field_positions = {'__RECORD__': (0, len(json_str))}
         
+        def find_key_value_bounds(s: str, key: str, start: int) -> Tuple[int, int, int]:
+            key_pattern = f'"{key}"'
+            key_start = s.find(key_pattern, start)
+            if key_start == -1:
+                return -1, -1, -1
+            key_end = key_start + len(key_pattern)
+            colon_pos = s.find(':', key_end)
+            if colon_pos == -1:
+                return -1, -1, -1
+            value_start = colon_pos + 1
+            while value_start < len(s) and s[value_start].isspace():
+                value_start += 1
+            value_end = value_start
+            stack = []
+            while value_end < len(s):
+                if s[value_end] in '{[':
+                    stack.append(s[value_end])
+                elif s[value_end] in '}]':
+                    if stack and ((s[value_end] == '}' and stack[-1] == '{') or (s[value_end] == ']' and stack[-1] == '[')):
+                        stack.pop()
+                    if not stack:
+                        value_end += 1
+                        break
+                elif not stack and s[value_end] in ',}]':
+                    break
+                value_end += 1
+            return key_start, value_start, value_end
+
         def traverse(obj, path=""):
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     new_path = f"{path}.{k}" if path else k
-                    key_start = json_str.index(f'"{k}":', field_positions['RECORD'][0]) + len(f'"{k}":')
-                    while json_str[key_start].isspace():
-                        key_start += 1
-                    value_start = key_start
-                    try:
-                        parsed, end = decoder.raw_decode(json_str[value_start:])
-                        field_positions[f"RECORD.{new_path}"] = (value_start, value_start + end)
+                    key_start, value_start, value_end = find_key_value_bounds(json_str, k, field_positions['__RECORD__'][0])
+                    if key_start != -1:
+                        field_positions[new_path] = (value_start, value_end)
+                        # Only continue traversing if the value is also a dictionary
                         if isinstance(v, dict):
                             traverse(v, new_path)
-                    except json.JSONDecodeError:
-                        print(f"Error parsing value for key '{k}' at position {value_start}")
-            # We no longer traverse into lists
+            # We don't traverse into lists or other types
 
         try:
             parsed_json, _ = decoder.raw_decode(json_str)
@@ -197,7 +207,6 @@ class IJSONL:
             print(f"JSON string: {json_str}")
 
         return field_positions
-
 
 
     def add_record(self, record: Dict):
@@ -215,7 +224,9 @@ class IJSONL:
         n = self.increment_n()
 
         # Traverse JSON and update indices
-        field_positions = self.traverse_json(json_str)
+        field_positions = parse_json_positions_binary(
+                json_str.encode('utf-8'))
+        field_positions["__RECORD__"] = field_positions[""]
         print(f"Field positions: {field_positions}")
         
         new_fields = []
@@ -225,11 +236,10 @@ class IJSONL:
                 new_fields.append(field)
                 self.init_index(field)
             
-            if field == 'RECORD':
+            if field == '__RECORD__':
                 self.append_index(field, n - 1, start_pos, end_pos)
             else:
                 self.append_index(field, n - 1, start_pos + start, start_pos + end)
-
         # Update header if there are new fields
         if new_fields:
             self.update_header(n, new_fields)
@@ -239,15 +249,8 @@ class IJSONL:
 
 
     def get_record(self, index: int, fields=None):
-        """
-        Get record data by index using field indices.
-        
-        :param index: The index of the record to retrieve.
-        :param fields: None for full record, a string for a single field, or a list of fields.
-        :return: The requested data (str, bytes, or dict depending on fields parameter).
-        """
         if fields is None:
-            start, end = self.get_index_entry('RECORD', index)
+            start, end = self.get_index_entry('__RECORD__', index)  # Changed from 'RECORD' to '__RECORD__'
             with open(self.data_file, 'r') as f:
                 f.seek(start)
                 return f.read(end - start).strip()
@@ -256,9 +259,8 @@ class IJSONL:
         fields_to_fetch = [fields] if isinstance(fields, str) else fields
         
         for field in fields_to_fetch:
-            full_field = f"RECORD.{field}" if field != "RECORD" else "RECORD"
             try:
-                start, end = self.get_index_entry(full_field, index)
+                start, end = self.get_index_entry(field, index)
                 with open(self.data_file, 'rb') as f:
                     f.seek(start)
                     field_value = f.read(end - start)
@@ -280,23 +282,139 @@ class IJSONL:
         
         return result
 
+
     def _set_nested_dict(self, d, keys, value):
         """Helper method to set value in nested dictionary."""
         for key in keys[:-1]:
             d = d.setdefault(key, {})
         d[keys[-1]] = value
 
+    def get_record(self, index: int, fields=None):
+        """
+        Get record data by index using field indices.
+        
+        :param index: The index of the record to retrieve.
+        :param fields: None for full record, a string for a single field, or a list of fields.
+        :return: The requested data (str, bytes, or dict depending on fields parameter).
+        """
+        if fields is None:
+            # Retrieve full record
+            start, end = self.get_index_entry('__RECORD__', index)
+            with open(self.data_file, 'rb') as f:
+                f.seek(start)
+                return f.read(end - start)
+        
+        is_str = isinstance(fields, str)
+        if is_str:
+            fields = [fields]
+        if isinstance(fields, list):
+            # Retrieve multiple fields
+            result = {}
+            for field in fields:
+                try:
+                    start, end = self.get_index_entry(field, index)
+                    with open(self.data_file, 'rb') as f:
+                        f.seek(start)
+                        result[field] = f.read(end - start)
+                except FileNotFoundError:
+                    # Field index doesn't exist, set to None
+                    result[field] = None
+            return result
+        if is_str:
+            result = result[fields[0]]
+        
+        raise ValueError("Fields must be None, a string, or a list of strings")
+
 
 
 # Example usage and testing
 if __name__ == "__main__":
-    ijsonl = IJSONL("test")
-    ijsonl.add_record({"name": "Alice", "age": 30})
-    ijsonl.add_record({"name": "Bob", "age": 25, "address": {"city": "New York", "zip": "10001"}})
-    ijsonl.add_record({"name": "Charlie", "age": 35, "hobbies": ["reading", "swimming"]})
+    # Initialize IJSONL
+    ijsonl = IJSONL("test_data")
 
-    # Print contents of header file for verification
-    print("Header:")
-    n, num_fields = ijsonl.get_header_info()
-    print(f"N: {n}")
-    print(f"num fields: {num_fields}")
+    # Test data with nested structures and varying fields
+    test_records = [
+        {
+            "name": "Alice",
+            "age": 30,
+            "address": {
+                "street": "123 Main St",
+                "city": "Wonderland",
+                "zip": "12345"
+            },
+            "hobbies": ["reading", "painting"],
+            "family": {
+                "spouse": "Bob",
+                "children": [
+                    {"name": "Charlie", "age": 5},
+                    {"name": "Diana", "age": 3}
+                ]
+            }
+        },
+        {
+            "name": "Eve",
+            "age": 28,
+            "skills": ["hacking", "cryptography"],
+            "job": {
+                "title": "Security Analyst",
+                "company": {
+                    "name": "Tech Corp",
+                    "location": "Cyberspace"
+                }
+            }
+        },
+        {
+            "name": "Mallory",
+            "pets": [
+                {"type": "cat", "name": "Whiskers"},
+                {"type": "dog", "name": "Fido"}
+            ],
+            "education": {
+                "degree": "Ph.D",
+                "field": "Computer Science",
+                "university": {
+                    "name": "Tech University",
+                    "location": "Silicon Valley"
+                }
+            }
+        }
+    ]
+
+    # Add records
+    for record in test_records:
+        ijsonl.add_record(record)
+
+    print("Testing get_record method:")
+
+    # Test getting full records
+    print("\nFull Records:")
+    for i in range(3):
+        print(f"Record {i}:", ijsonl.get_record(i))
+
+    # Test getting single fields
+    print("\nSingle Fields:")
+    print("Name (Record 0):", ijsonl.get_record(0, "name"))
+    print("Age (Record 1):", ijsonl.get_record(1, "age"))
+    print("Pets (Record 2):", ijsonl.get_record(2, "pets"))
+
+    # Test getting nested fields
+    print("\nNested Fields:")
+    print("Address.City (Record 0):", ijsonl.get_record(0, "address.city"))
+    print("Job.Company.Name (Record 1):", ijsonl.get_record(1, "job.company.name"))
+    print("Education.University.Location (Record 2):", ijsonl.get_record(2, "education.university.location"))
+
+    # Test getting multiple fields
+    print("\nMultiple Fields:")
+    print("Name and Age (Record 0):", ijsonl.get_record(0, ["name", "age"]))
+    print("Skills and Job.Title (Record 1):", ijsonl.get_record(1, ["skills", "job.title"]))
+    print("Name and Pets[0].Name (Record 2):", ijsonl.get_record(2, ["name", "pets.0.name"]))
+
+    # Test getting non-existent fields
+    print("\nNon-existent Fields:")
+    print("Non-existent field (Record 0):", ijsonl.get_record(0, "non_existent"))
+    print("Multiple fields including non-existent (Record 1):", ijsonl.get_record(1, ["name", "non_existent", "age"]))
+
+    print("\nTesting complete.")
+
+    import shutil
+    shutil.rmtree("test_data.ijsonl")
