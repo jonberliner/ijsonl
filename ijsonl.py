@@ -89,7 +89,7 @@ class IJSONL:
 
     def append_index(self, field: str, idx: int, start_offset: int, end_offset: int):
         index_file = os.path.join(self.index_dir, f"{field}.index")
-        
+        print(f"appending index {idx} for field {field}")
         with open(index_file, 'r+b') as f:
             # Read current header
             f.seek(0)
@@ -104,7 +104,7 @@ class IJSONL:
 
             # Update header
             f.seek(0)
-            f.write(struct.pack('QQ', idx, num_entries + 1))
+            f.write(struct.pack('qQ', idx, num_entries + 1))
 
             # Append new entry
             f.seek(0, 2)  # Go to end of file
@@ -116,97 +116,65 @@ class IJSONL:
     def get_index_entry(self, field: str, row_number: int) -> Tuple[int, int]:
         """Read an index entry for a field, given the row number."""
         index_file = os.path.join(self.index_dir, f"{field}.index")
-        
+
         with open(index_file, 'rb') as f:
             last_idx, num_entries = struct.unpack('qQ', f.read(16))
-            
+
             if row_number > last_idx:
-                raise IndexError(f"Row number {row_number} out of range")
+                raise IndexError(f"Row number {row_number} out of range for field: {field} (last_idx: {last_idx})")
             
-            index_position = self.map_index_to_row(field, row_number)
-            
-            f.seek(16 + index_position * 16)  # 16 bytes for lead int64s, 16 bytes per entry
+            # Correctly map row_number to index position
+            index_position = self.row_idx_to_index_idx(field, row_number)
+            if index_position == -1:
+                return None, None
+
+            if index_position > num_entries - 1:
+                return None, None
+                raise IndexError(f"Row number {row_number} maps to index position {index_position} exceeding field entries: {num_entries} for field: {field}")
+
+            f.seek(16 + index_position * 16)  # 16 bytes for header, 16 bytes per entry
             return struct.unpack('QQ', f.read(16))
 
-    def map_index_to_row(self, field: str, index_position: int) -> int:
-        """Map an index position to its actual row number, considering gaps."""
+    def row_idx_to_index_idx(self, field, row_idx):
         index_file = os.path.join(self.index_dir, f"{field}.index")
         gaps_file = os.path.join(self.index_dir, f"{field}.gaps")
-        
-        with open(index_file, 'rb') as f:
-            last_idx, num_entries = struct.unpack('qQ', f.read(16))
-            
-            if index_position > last_idx:
-                raise IndexError(f"Index position {index_position} out of range")
-        
-        row_number = index_position  # Start with the assumption of no gaps
-        
-        with open(gaps_file, 'rb') as f:
-            while True:
-                gap_data = f.read(16)
-                if not gap_data:
-                    break
-                gap_start, gap_length = struct.unpack('QQ', gap_data)
-                if gap_start <= row_number:
-                    row_number += gap_length
-                else:
-                    break
-        
-        return row_number
-
-
-    def traverse_json(self, json_str: str) -> Dict[str, Tuple[int, int]]:
-        decoder = JSONDecoder()
-        field_positions = {'__RECORD__': (0, len(json_str))}
-        
-        def find_key_value_bounds(s: str, key: str, start: int) -> Tuple[int, int, int]:
-            key_pattern = f'"{key}"'
-            key_start = s.find(key_pattern, start)
-            if key_start == -1:
-                return -1, -1, -1
-            key_end = key_start + len(key_pattern)
-            colon_pos = s.find(':', key_end)
-            if colon_pos == -1:
-                return -1, -1, -1
-            value_start = colon_pos + 1
-            while value_start < len(s) and s[value_start].isspace():
-                value_start += 1
-            value_end = value_start
-            stack = []
-            while value_end < len(s):
-                if s[value_end] in '{[':
-                    stack.append(s[value_end])
-                elif s[value_end] in '}]':
-                    if stack and ((s[value_end] == '}' and stack[-1] == '{') or (s[value_end] == ']' and stack[-1] == '[')):
-                        stack.pop()
-                    if not stack:
-                        value_end += 1
-                        break
-                elif not stack and s[value_end] in ',}]':
-                    break
-                value_end += 1
-            return key_start, value_start, value_end
-
-        def traverse(obj, path=""):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    new_path = f"{path}.{k}" if path else k
-                    key_start, value_start, value_end = find_key_value_bounds(json_str, k, field_positions['__RECORD__'][0])
-                    if key_start != -1:
-                        field_positions[new_path] = (value_start, value_end)
-                        # Only continue traversing if the value is also a dictionary
-                        if isinstance(v, dict):
-                            traverse(v, new_path)
-            # We don't traverse into lists or other types
-
         try:
-            parsed_json, _ = decoder.raw_decode(json_str)
-            traverse(parsed_json)
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON: {e}")
-            print(f"JSON string: {json_str}")
+            with open(gaps_file, 'rb') as f:
+                gaps = []
+                while True:
+                    gap_data = f.read(16)
+                    if not gap_data:
+                        break
+                    gaps.append(struct.unpack('QQ', gap_data))
+        except FileNotFoundError:
+            gaps = []  # No gaps file, so no gaps to account for
+            gaps.sort(key=lambda x: x[0])
+            # Read index file
 
-        return field_positions
+        with open(index_file, 'rb') as f:
+            index = []
+            while True:
+                index_data = f.read(16)
+                if not index_data:
+                    break
+                index.append(struct.unpack('QQ', index_data))
+        
+        # Calculate the actual position in the index list
+        actual_pos = row_idx
+        for start, length in gaps:
+            if row_idx >= start:
+                if row_idx < start + length:
+                    return -1  # n is within a gap
+                actual_pos -= length
+            else:
+                break
+        
+        # Check if the actual position is within the index list
+        if 0 <= actual_pos < len(index):
+            return actual_pos
+            # return index[actual_pos]
+        else:
+            return -1  # Out of range
 
 
     def add_record(self, record: Dict):
@@ -248,41 +216,6 @@ class IJSONL:
         print(f"All fields: {self.get_fields()}")
 
 
-    def get_record(self, index: int, fields=None):
-        if fields is None:
-            start, end = self.get_index_entry('__RECORD__', index)  # Changed from 'RECORD' to '__RECORD__'
-            with open(self.data_file, 'r') as f:
-                f.seek(start)
-                return f.read(end - start).strip()
-        
-        result = {}
-        fields_to_fetch = [fields] if isinstance(fields, str) else fields
-        
-        for field in fields_to_fetch:
-            try:
-                start, end = self.get_index_entry(field, index)
-                with open(self.data_file, 'rb') as f:
-                    f.seek(start)
-                    field_value = f.read(end - start)
-                    # Parse the field_value if it's a list or dict
-                    try:
-                        parsed_value = json.loads(field_value)
-                        if isinstance(parsed_value, (dict, list)):
-                            field_value = parsed_value
-                    except json.JSONDecodeError:
-                        # If it's not a valid JSON, keep it as bytes
-                        pass
-                    self._set_nested_dict(result, field.split('.'), field_value)
-            except FileNotFoundError:
-                # Field index doesn't exist, set to None
-                self._set_nested_dict(result, field.split('.'), None)
-        
-        if isinstance(fields, str):
-            return result.get(fields.split('.')[-1])
-        
-        return result
-
-
     def _set_nested_dict(self, d, keys, value):
         """Helper method to set value in nested dictionary."""
         for key in keys[:-1]:
@@ -300,6 +233,7 @@ class IJSONL:
         if fields is None:
             # Retrieve full record
             start, end = self.get_index_entry('__RECORD__', index)
+            if start == None: return None
             with open(self.data_file, 'rb') as f:
                 f.seek(start)
                 return f.read(end - start)
@@ -311,14 +245,18 @@ class IJSONL:
             # Retrieve multiple fields
             result = {}
             for field in fields:
-                try:
-                    start, end = self.get_index_entry(field, index)
-                    with open(self.data_file, 'rb') as f:
-                        f.seek(start)
-                        result[field] = f.read(end - start)
-                except FileNotFoundError:
-                    # Field index doesn't exist, set to None
+                if not os.path.exists(os.path.join(self.index_dir, f"{field}.index")):
                     result[field] = None
+                else:
+                    try:
+                        start, end = self.get_index_entry(field, index)
+                        if start == None: return None
+                        with open(self.data_file, 'rb') as f:
+                            f.seek(start)
+                            result[field] = f.read(end - start)
+                    except FileNotFoundError:
+                        # Field index doesn't exist, set to None
+                        result[field] = None
             return result
         if is_str:
             result = result[fields[0]]
@@ -384,37 +322,49 @@ if __name__ == "__main__":
     for record in test_records:
         ijsonl.add_record(record)
 
-    print("Testing get_record method:")
+    while True:
+        print("Testing get_record method:")
 
-    # Test getting full records
-    print("\nFull Records:")
-    for i in range(3):
-        print(f"Record {i}:", ijsonl.get_record(i))
+        # Test getting full records
+        print("\nFull Records:")
+        for i in range(3):
+            print(f"Record {i}:", ijsonl.get_record(i))
 
-    # Test getting single fields
-    print("\nSingle Fields:")
-    print("Name (Record 0):", ijsonl.get_record(0, "name"))
-    print("Age (Record 1):", ijsonl.get_record(1, "age"))
-    print("Pets (Record 2):", ijsonl.get_record(2, "pets"))
+        # Test getting single fields
+        print("\nSingle Fields:")
+        print("Address (Record 0):", ijsonl.get_record(0, "address.city"))
+        print("Address (Record 0):", ijsonl.get_record(0, "address.city"))
+        print("Name (Record 0):", ijsonl.get_record(0, "name"))
+        print("Name (Record 0):", ijsonl.get_record(0, "name"))
+        print("Name (Record 1):", ijsonl.get_record(1, "name"))
+        print("Name (Record 2):", ijsonl.get_record(2, "name"))
+        print("Age (Record 1):", ijsonl.get_record(1, "age"))
+        print("Address (Record 0):", ijsonl.get_record(0, "address"))
+        print("Address (Record 0):", ijsonl.get_record(0, "address.city"))
+        print("Address (Record 0):", ijsonl.get_record(0, "address.dog"))
+        
+        # print("Street (Record 0):", ijsonl.get_record(1, "address"))
+        # print("Pets (Record 2):", ijsonl.get_record(2, "pets.0.type"))
+        print("Pets (Record 2):", ijsonl.get_record(0, "pets"))
 
-    # Test getting nested fields
-    print("\nNested Fields:")
-    print("Address.City (Record 0):", ijsonl.get_record(0, "address.city"))
-    print("Job.Company.Name (Record 1):", ijsonl.get_record(1, "job.company.name"))
-    print("Education.University.Location (Record 2):", ijsonl.get_record(2, "education.university.location"))
+        # Test getting nested fields
+        print("\nNested Fields:")
+        print("Address.City (Record 0):", ijsonl.get_record(0, "address.city"))
+        print("Job.Company.Name (Record 1):", ijsonl.get_record(0, "job.company.name"))
+        print("Education.University.Location (Record 2):", ijsonl.get_record(2, "education.university.location"))
 
-    # Test getting multiple fields
-    print("\nMultiple Fields:")
-    print("Name and Age (Record 0):", ijsonl.get_record(0, ["name", "age"]))
-    print("Skills and Job.Title (Record 1):", ijsonl.get_record(1, ["skills", "job.title"]))
-    print("Name and Pets[0].Name (Record 2):", ijsonl.get_record(2, ["name", "pets.0.name"]))
+        # Test getting multiple fields
+        print("\nMultiple Fields:")
+        print("Name and Age (Record 0):", ijsonl.get_record(0, ["name", "age"]))
+        print("Skills and Job.Title (Record 1):", ijsonl.get_record(1, ["skills", "job.title"]))
+        print("Name and Pets[0].Name (Record 2):", ijsonl.get_record(2, ["name", "pets.0.name"]))
 
-    # Test getting non-existent fields
-    print("\nNon-existent Fields:")
-    print("Non-existent field (Record 0):", ijsonl.get_record(0, "non_existent"))
-    print("Multiple fields including non-existent (Record 1):", ijsonl.get_record(1, ["name", "non_existent", "age"]))
+        # Test getting non-existent fields
+        print("\nNon-existent Fields:")
+        print("Non-existent field (Record 0):", ijsonl.get_record(0, "non_existent"))
+        print("Multiple fields including non-existent (Record 1):", ijsonl.get_record(1, ["name", "non_existent", "age"]))
 
-    print("\nTesting complete.")
-
+        print("\nTesting complete.")
+        break
     import shutil
     shutil.rmtree("test_data.ijsonl")
